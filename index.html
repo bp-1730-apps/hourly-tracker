@@ -92,7 +92,7 @@ table.ov td.cur{outline:2px solid var(--gold);outline-offset:-2px}
 <div class="hdr">
  <div><h1>Hourly Tracker</h1><small>Plant 1730 &middot; hourly on-target tracker</small></div>
  <div class="r"><span id="l2lpill" class="pill-l2l">Actuals from L2L: no data yet</span>
-  <button class="btn" id="bPull">Refresh L2L</button><button class="btn" id="bImport">Paste L2L data (backup)</button><button class="btn" id="bUpc">Units per case</button></div>
+  <button class="btn" id="bPull">Refresh L2L</button><button class="btn" id="bUpc">Units per case</button></div>
 </div>
 <div class="bar"><div class="row">
  <button class="btn pri" id="bLoad">Load schedule...</button><input type="file" id="file" accept=".xlsb,.xlsx,.xlsm" style="display:none">
@@ -132,7 +132,7 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
 (function(){
 "use strict";
 var TRACKED=["MP4","PXM6"], LCODE={MP4:"BP-LINE3",PXM6:"BP-LINE2"}, LID={MP4:3049,PXM6:3193}, ALL=["2A","PXM6","PL1","MP4","PL2","2E"], NH=12;
-var SITE="2", KEY="uXR2MqhsGQsaZWEV5fs2lOlR1dfVPlKE", L2L_BASE="https://lakeviewfarms.leading2lean.com/api/1.0";
+var SITE="2", KEY="", L2L_BASE="https://lakeviewfarms.leading2lean.com/api/1.0";
 var DEF_UPC={"005307":12,"005415":6,"008184":6,"005305":12,"005306":12,"005375":6,"005381":6,"005382":6,"005383":6,"005416":6,"005417":6,"005418":6,"005419":6,"008185":6,"008246":6,"008500":6,"008545":12,"005338":6,"005339":6,"005349":6,"005361":6,"005376":6,"005403":6,"005405":6,"005406":6,"005408":6,"005409":6,"008182":8,"008183":8,"008226":6,"008227":6,"008232":6,"008252":6,"008253":6,"008225":6,"005407":6,"005362":6,"005173":6,"008175":6,"008177":6,"008179":6,"008186":6,"008234":6,"005439":12,"005401":6,"008176":6};
 var STORE="hourly_tracker_html_v1";
 var S={plans:{},shift:{},acts:{},dones:{},notes:{},running:{},upc:{},l2l:{MP4:[],PXM6:[]}};
@@ -427,15 +427,19 @@ async function pullLine(line,date){
   });
   return rows;
 }
+var feedUpdated="";
 async function pullAll(){
-  if(pulling)return;var date=curDate()||today();pulling=true;statusLabel();var errs=[],got=false;
-  for(var i=0;i<TRACKED.length;i++){var line=TRACKED[i];
-    try{var rows=await pullLine(line,date),seen={};
-      var keep=(S.l2l[line]||[]).filter(function(r){return rows.every(function(n){return rid(n)!==rid(r)})});
-      S.l2l[line]=keep.concat(rows).slice(-1500);got=true}
-    catch(e){errs.push(line+": "+e.message)}}
-  pulling=false;l2lErr=errs.join("; ");if(got){l2lAt=new Date();save();applyAll()}
-  render();
+  if(pulling)return;pulling=true;statusLabel();
+  try{
+    var r=await fetch("l2l.json?t="+Date.now(),{cache:"no-store"});
+    if(!r.ok)throw new Error("l2l.json not found (HTTP "+r.status+"). It must sit in the same folder as this page.");
+    var j=await r.json();
+    TRACKED.forEach(function(l){if(j.lines&&Array.isArray(j.lines[l]))S.l2l[l]=j.lines[l]});
+    feedUpdated=j.updated||"";l2lErr=(j.errors||[]).join("; ");
+    if(!feedUpdated&&!l2lErr)l2lErr="waiting for the first L2L pull (GitHub > Actions > Pull L2L data > Run workflow)";
+    l2lAt=new Date();save();applyAll();
+  }catch(e){l2lErr=(e&&e.message)||String(e)}
+  pulling=false;render();
 }
 
 // ---------- drawing
@@ -457,12 +461,13 @@ function render(){
   if(fk){var e=document.querySelector('[data-k="'+fk+'"]');if(e){e.focus();try{e.setSelectionRange(fpos,fpos)}catch(x){}}}
 }
 function later(ms){clearTimeout(rT);rT=setTimeout(render,ms||900)}
+function hm(s){var m=/(\d{2}):(\d{2})$/.exec(s||"");if(!m)return "";var h=+m[1];return ((h%12)||12)+":"+m[2]+(h>=12?" PM":" AM")}
 function statusLabel(){
-  var p=$("l2lpill");
-  if(pulling){p.textContent="Actuals from L2L: pulling...";p.style.background="#2b5c8f"}
-  else if(l2lErr&&!l2lAt){p.textContent="L2L PROBLEM: "+l2lErr.slice(0,90);p.style.background="var(--badfg)"}
-  else if(l2lErr){p.textContent="L2L updated "+l2lAt.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"})+" - PROBLEM: "+l2lErr.slice(0,60);p.style.background="#a8620a"}
-  else if(l2lAt){p.textContent="Actuals from L2L: updated "+l2lAt.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"});p.style.background="#1e7a3c"}
+  var p=$("l2lpill"),chk=l2lAt?l2lAt.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"}):"";
+  if(pulling){p.textContent="Actuals from L2L: checking...";p.style.background="#2b5c8f"}
+  else if(l2lErr&&!feedUpdated){p.textContent="L2L PROBLEM: "+l2lErr.slice(0,90);p.style.background="var(--badfg)"}
+  else if(l2lErr){p.textContent="L2L data from "+hm(feedUpdated)+" - PROBLEM: "+l2lErr.slice(0,60);p.style.background="#a8620a"}
+  else if(l2lAt){p.textContent="Actuals from L2L: last change "+hm(feedUpdated)+" (checked "+chk+")";p.style.background="#1e7a3c"}
   else{p.textContent="Actuals from L2L: no data yet";p.style.background="#6b7787"}
   var d=curDate(),t=[],miss=Object.keys(MISSING[d]||{});
   if(l2lErr)t.push("PROBLEM: "+l2lErr);if((S.l2l.MP4||[]).length||(S.l2l.PXM6||[]).length)t.push("Blue boxes came from L2L; type over one to correct it.");
@@ -655,7 +660,7 @@ document.addEventListener("mousedown",function(e){if(e.target.id==="mbg")closeMo
 document.addEventListener("keydown",function(e){if(e.key==="Escape")closeModal()});
 
 load();fillDates();applyAll();render();
-setTimeout(pullAll,600);setInterval(pullAll,300000);
+setTimeout(pullAll,600);setInterval(pullAll,120000);
 setInterval(function(){var a=document.activeElement;if(!(a&&(a.tagName==="INPUT"||a.tagName==="TEXTAREA"))&&!$("modal").innerHTML)render()},30000);
 window.__T={pullAll:pullAll,S:S,AUTO:AUTO,getAuto:function(){return AUTO},engine:engine,lineStatus:lineStatus,parseSchedule:parseSchedule,readRows:readRows,importL2L:importL2L,applyAll:applyAll,fillDates:fillDates,render:render,setTab:function(t){tab=t},STATS:STATS};
 })();
