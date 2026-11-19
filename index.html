@@ -92,7 +92,7 @@ table.ov td.cur{outline:2px solid var(--gold);outline-offset:-2px}
 <div class="hdr">
  <div><h1>Hourly Tracker</h1><small>Plant 1730 &middot; hourly on-target tracker</small></div>
  <div class="r"><span id="l2lpill" class="pill-l2l">Actuals from L2L: no data yet</span>
-  <button class="btn" id="bImport">Import L2L data</button><button class="btn" id="bUpc">Units per case</button></div>
+  <button class="btn" id="bPull">Refresh L2L</button><button class="btn" id="bImport">Paste L2L data (backup)</button><button class="btn" id="bUpc">Units per case</button></div>
 </div>
 <div class="bar"><div class="row">
  <button class="btn pri" id="bLoad">Load schedule...</button><input type="file" id="file" accept=".xlsb,.xlsx,.xlsm" style="display:none">
@@ -136,6 +136,7 @@ var SITE="2", KEY="uXR2MqhsGQsaZWEV5fs2lOlR1dfVPlKE", L2L_BASE="https://lakeview
 var DEF_UPC={"005307":12,"005415":6,"008184":6,"005305":12,"005306":12,"005375":6,"005381":6,"005382":6,"005383":6,"005416":6,"005417":6,"005418":6,"005419":6,"008185":6,"008246":6,"008500":6,"008545":12,"005338":6,"005339":6,"005349":6,"005361":6,"005376":6,"005403":6,"005405":6,"005406":6,"005408":6,"005409":6,"008182":8,"008183":8,"008226":6,"008227":6,"008232":6,"008252":6,"008253":6,"008225":6,"005407":6,"005362":6,"005173":6,"008175":6,"008177":6,"008179":6,"008186":6,"008234":6,"005439":12,"005401":6,"008176":6};
 var STORE="hourly_tracker_html_v1";
 var S={plans:{},shift:{},acts:{},dones:{},notes:{},running:{},upc:{},l2l:{MP4:[],PXM6:[]}};
+var pulling=false,l2lErr="",PROD={};
 var AUTO={}, STATS={}, MISSING={}, tab="MP4", l2lAt=null, l2lMsg="", rT=null;
 
 // ---------- helpers
@@ -385,6 +386,58 @@ function l2lUrl(line,date){
   return L2L_BASE+"/pitches/?line="+LID[line]+"&pitch_start__gte="+encodeURIComponent(a)+"&pitch_start__lte="+encodeURIComponent(b)+"&limit=500&site="+SITE+"&auth="+KEY;
 }
 
+
+// ---------- automatic L2L pull (read only)
+var CODE_KEYS=["code","product_code","productcode","item_code","itemcode","item_number","sku","number","partnumber","part_number"];
+function extractCode(o){
+  if(!o||typeof o!=="object")return "";
+  for(var i=0;i<CODE_KEYS.length;i++)if(o[CODE_KEYS[i]]!=null&&o[CODE_KEYS[i]]!=="")return String(o[CODE_KEYS[i]]);
+  var f=["description","name","title","label"];
+  for(i=0;i<f.length;i++){var m=/(?<!\d)(\d{6,7})(?!\d)/.exec(String(o[f[i]]||""));if(m)return m[1]}
+  return "";
+}
+function idOf(v){if(v==null||v==="")return "";return typeof v==="object"?String(v.id==null?"":v.id):String(v)}
+async function l2lGet(path,params){
+  var p=Object.assign({},params,{site:SITE,auth:KEY}),q=Object.keys(p).map(function(k){return encodeURIComponent(k)+"="+encodeURIComponent(p[k])}).join("&"),r;
+  try{r=await fetch(L2L_BASE+"/"+path+"/?"+q)}catch(e){throw new Error("the browser blocked or could not reach L2L ("+e.message+"). Use Paste L2L data instead.")}
+  var txt=await r.text();
+  if(!r.ok)throw new Error(path+" -> HTTP "+r.status+" "+txt.slice(0,150));
+  try{return JSON.parse(txt)}catch(e){throw new Error(path+" did not return JSON: "+txt.slice(0,100))}
+}
+async function productCode(id){
+  if(!id)return "";if(id in PROD)return PROD[id];
+  var code="";
+  try{var j=await l2lGet("productcomponents",{id:id}),l=asList(j),o=l.length?l[0]:(Array.isArray(j)&&j.length?j[0]:(j&&typeof j==="object"&&!("success" in j)?j:null));code=extractCode(o)}catch(e){}
+  PROD[id]=code;return code;
+}
+async function pullLine(line,date){
+  var a=addDays(date,-1)+" 12:00:00",b=addDays(date,1)+" 12:00:00",rows=[],offset=0;
+  while(offset<5000){
+    var j=await l2lGet("pitches",{line:LID[line],pitch_start__gte:a,pitch_start__lte:b,limit:500,offset:offset});
+    if(j&&j.success===false)throw new Error("L2L says: "+j.error);
+    var got=asList(j);rows=rows.concat(got);
+    var size=(j&&typeof j.limit==="number"&&j.limit>0)?j.limit:500;
+    if(!got.length||got.length<Math.min(size,500))break;offset+=got.length;
+  }
+  var ids={};rows.forEach(function(r){[r.actual_product,r.actual_product_id,r.planned_product,r.planned_product_id,r.product,r.product_id].forEach(function(v){var i=idOf(v);if(i)ids[i]=1})});
+  await Promise.all(Object.keys(ids).map(productCode));
+  rows.forEach(function(r){
+    r.actual_product_code=r.actual_product_code||PROD[idOf(r.actual_product||r.actual_product_id)]||"";
+    r.planned_product_code=r.planned_product_code||PROD[idOf(r.planned_product||r.planned_product_id||r.product||r.product_id)]||"";
+  });
+  return rows;
+}
+async function pullAll(){
+  if(pulling)return;var date=curDate()||today();pulling=true;statusLabel();var errs=[],got=false;
+  for(var i=0;i<TRACKED.length;i++){var line=TRACKED[i];
+    try{var rows=await pullLine(line,date),seen={};
+      var keep=(S.l2l[line]||[]).filter(function(r){return rows.every(function(n){return rid(n)!==rid(r)})});
+      S.l2l[line]=keep.concat(rows).slice(-1500);got=true}
+    catch(e){errs.push(line+": "+e.message)}}
+  pulling=false;l2lErr=errs.join("; ");if(got){l2lAt=new Date();save();applyAll()}
+  render();
+}
+
 // ---------- drawing
 var COL={ahead:["var(--okbg)","var(--okfg)"],on:["var(--warnbg)","var(--warnfg)"],behind:["var(--badbg)","var(--badfg)"],none:["#e8ecf2","var(--muted)"]};
 function alertH(k,t){return '<div class="alert '+k+'"><b></b><span>'+esc(t)+'</span></div>'}
@@ -406,14 +459,17 @@ function render(){
 function later(ms){clearTimeout(rT);rT=setTimeout(render,ms||900)}
 function statusLabel(){
   var p=$("l2lpill");
-  if(l2lAt){p.textContent="Actuals from L2L: pasted "+l2lAt.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"});p.style.background="#1e7a3c"}
-  else{var n=(S.l2l.MP4||[]).length+(S.l2l.PXM6||[]).length;p.textContent=n?"Actuals from L2L: "+n+" records saved":"Actuals from L2L: none pasted yet";p.style.background=n?"#1e7a3c":"#6b7787"}
+  if(pulling){p.textContent="Actuals from L2L: pulling...";p.style.background="#2b5c8f"}
+  else if(l2lErr&&!l2lAt){p.textContent="L2L PROBLEM: "+l2lErr.slice(0,90);p.style.background="var(--badfg)"}
+  else if(l2lErr){p.textContent="L2L updated "+l2lAt.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"})+" - PROBLEM: "+l2lErr.slice(0,60);p.style.background="#a8620a"}
+  else if(l2lAt){p.textContent="Actuals from L2L: updated "+l2lAt.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"});p.style.background="#1e7a3c"}
+  else{p.textContent="Actuals from L2L: no data yet";p.style.background="#6b7787"}
   var d=curDate(),t=[],miss=Object.keys(MISSING[d]||{});
-  if((S.l2l.MP4||[]).length||(S.l2l.PXM6||[]).length)t.push("Blue boxes came from L2L; type over one to correct it.");
+  if(l2lErr)t.push("PROBLEM: "+l2lErr);if((S.l2l.MP4||[]).length||(S.l2l.PXM6||[]).length)t.push("Blue boxes came from L2L; type over one to correct it.");
   if(miss.length)t.push("Units per case needed for: "+miss.sort().join(", "));
   TRACKED.forEach(function(line){var st=STATS[d+"|"+line];if(st&&st.records){
     var x=line+": "+st.records+" L2L records, "+st.used+" used";
-    [["by_schedule","matched to the schedule by time (pasted data has product ids, not item codes)"],["blank_actual","blank actual"],["no_code","no product code"],["no_time","bad time"],["no_units","hours waiting for units per case"],["off_schedule","hours whose product is not on the schedule"]].forEach(function(q){if(st[q[0]])x+=", "+st[q[0]]+" "+q[1]});
+    [["by_schedule","matched to the schedule by time (L2L gave no product code)"],["blank_actual","blank actual"],["no_code","no product code"],["no_time","bad time"],["no_units","hours waiting for units per case"],["off_schedule","hours whose product is not on the schedule"]].forEach(function(q){if(st[q[0]])x+=", "+st[q[0]]+" "+q[1]});
     t.push(x)}});
   $("stats").textContent=t.join("   |   ");
 }
@@ -559,12 +615,13 @@ function onFile(f){
   fr.readAsArrayBuffer(f);
 }
 document.addEventListener("click",function(e){
-  var t=e.target.closest("[data-tab],[data-run],[data-close],#bLoad,#bImport,#bUpc,#doImport,#clearL2L,#saveUpc");if(!t)return;
+  var t=e.target.closest("[data-tab],[data-run],[data-close],#bLoad,#bPull,#bImport,#bUpc,#doImport,#clearL2L,#saveUpc");if(!t)return;
   if(t.dataset.tab){tab=t.dataset.tab;render();return}
   if(t.dataset.run!=null){var d=curDate(),k=d+"|"+tab,m=(S.running[k]=S.running[k]||{}),i=t.dataset.run;
     if(m[i]!=null)delete m[i];else m[i]=Date.now();save();render();return}
   if(t.dataset.close){closeModal();return}
   if(t.id==="bLoad")$("file").click();
+  else if(t.id==="bPull")pullAll();
   else if(t.id==="bImport")importDialog();
   else if(t.id==="bUpc")upcDialog();
   else if(t.id==="doImport"){TRACKED.forEach(function(l){var ta=$("ta_"+l);if(!ta||!ta.value.trim())return;var r=importL2L(l,ta.value);
@@ -591,15 +648,16 @@ document.addEventListener("change",function(e){
     else delete S.dones[key];
     save();render();return}
   if(t.id==="file"&&t.files[0]){onFile(t.files[0]);t.value=""}
-  else if(t.id==="date"){syncShift();applyAll();render()}
+  else if(t.id==="date"){syncShift();applyAll();render();pullAll()}
   else if(t.id==="shift"){var d=curDate();if(d){S.shift[d]=+t.value;save();applyAll();render()}}
 });
 document.addEventListener("mousedown",function(e){if(e.target.id==="mbg")closeModal()});
 document.addEventListener("keydown",function(e){if(e.key==="Escape")closeModal()});
 
 load();fillDates();applyAll();render();
+setTimeout(pullAll,600);setInterval(pullAll,300000);
 setInterval(function(){var a=document.activeElement;if(!(a&&(a.tagName==="INPUT"||a.tagName==="TEXTAREA"))&&!$("modal").innerHTML)render()},30000);
-window.__T={S:S,AUTO:AUTO,getAuto:function(){return AUTO},engine:engine,lineStatus:lineStatus,parseSchedule:parseSchedule,readRows:readRows,importL2L:importL2L,applyAll:applyAll,fillDates:fillDates,render:render,setTab:function(t){tab=t},STATS:STATS};
+window.__T={pullAll:pullAll,S:S,AUTO:AUTO,getAuto:function(){return AUTO},engine:engine,lineStatus:lineStatus,parseSchedule:parseSchedule,readRows:readRows,importL2L:importL2L,applyAll:applyAll,fillDates:fillDates,render:render,setTab:function(t){tab=t},STATS:STATS};
 })();
 </script>
 </body>
